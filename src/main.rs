@@ -5,7 +5,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     path::Path,
     sync::Arc,
@@ -38,6 +38,16 @@ const POSITION_STOP_LOSS_FRACTION: f64 = -1.0;
 /// Hard time stop. Far shorter than the previous 600 ticks because basis
 /// trades that haven't moved in a couple of minutes statistically don't.
 const POSITION_TIMEOUT_TICKS: u32 = 120;
+/// EMA smoothing factor for the per-pair basis (TOB gross spread).
+/// 0.05 corresponds to ~20-poll half-life, ~30s at the default 1.5s poll.
+const BASIS_EMA_ALPHA: f64 = 0.05;
+/// Number of polls a pair must be observed before the basis filter
+/// will gate decisions on it. Below this we have no reliable estimate
+/// of the typical spread.
+const BASIS_WARMUP_SAMPLES: u64 = 60;
+/// Number of standard deviations above the EMA the current spread must
+/// reach before a position is allowed to open. Larger = stricter.
+const BASIS_K_SIGMA: f64 = 2.0;
 const RECORDS_PATH: &str = "data/interesting-opportunities.json";
 
 #[derive(Clone)]
@@ -394,6 +404,50 @@ struct RuntimeState {
     closed_trades: Vec<ClosedTrade>,
     realized_cumulative_net: f64,
     realized_trades_reset_at: String,
+    /// Rolling per-pair statistics on the directional gross spread
+    /// `sell_bid - buy_ask`. Keyed by `"{buy_name}>{sell_name}"`.
+    /// Updated every poll for every pair where both venues have a
+    /// fresh bid+ask, then read by `maybe_open_position` to gate
+    /// on statistical significance vs typical basis.
+    pair_basis_stats: HashMap<String, BasisStats>,
+}
+
+#[derive(Clone, Default)]
+struct BasisStats {
+    /// Exponential moving average of `sell_bid - buy_ask`.
+    ema: f64,
+    /// EMA of the squared deviation from `ema`. Acts as a variance proxy.
+    variance_ema: f64,
+    /// Number of samples ingested. Filter waits until this exceeds
+    /// `BASIS_WARMUP_SAMPLES` before gating.
+    samples: u64,
+}
+
+impl BasisStats {
+    fn update(&mut self, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
+        if self.samples == 0 {
+            self.ema = value;
+            self.variance_ema = 0.0;
+        } else {
+            let prev_ema = self.ema;
+            self.ema = BASIS_EMA_ALPHA * value + (1.0 - BASIS_EMA_ALPHA) * prev_ema;
+            let dev = value - prev_ema;
+            self.variance_ema =
+                BASIS_EMA_ALPHA * dev * dev + (1.0 - BASIS_EMA_ALPHA) * self.variance_ema;
+        }
+        self.samples = self.samples.saturating_add(1);
+    }
+
+    fn stddev(&self) -> f64 {
+        self.variance_ema.max(0.0).sqrt()
+    }
+
+    fn is_warm(&self) -> bool {
+        self.samples >= BASIS_WARMUP_SAMPLES
+    }
 }
 
 #[derive(Deserialize)]
@@ -439,6 +493,7 @@ async fn main() -> anyhow::Result<()> {
         closed_trades: Vec::new(),
         realized_cumulative_net: 0.0,
         realized_trades_reset_at: now(),
+        pair_basis_stats: HashMap::new(),
     }));
     let state = AppState {
         snapshot: snapshot.clone(),
@@ -643,6 +698,7 @@ async fn poll_loop(
             realized_trades_reset_at,
         ) = {
             let mut runtime = runtime.write().await;
+            update_pair_basis_stats(&mut runtime, &prices);
             if let Some(opportunity) = visible_opportunity.clone() {
                 let depth_net = max_profitable_size.estimated_net_profit.unwrap_or(0.0);
                 if max_profitable_size.size_btc > 0.0
@@ -1564,6 +1620,42 @@ fn pair_key(buy_exchange: &str, sell_exchange: &str) -> String {
     }
 }
 
+/// Update the rolling per-pair basis EMA + variance from this poll's prices.
+///
+/// We only track ordered pairs where both venues are in the
+/// `UsdtLinearPerp` tier and have a fresh, valid `(bid, ask)` from the
+/// current poll. The stored `BasisStats` is keyed by
+/// `"{buy_name}>{sell_name}"` so direction-asymmetric bid/ask handling
+/// is captured (the spread `sell_bid - buy_ask` for `(A, B)` differs
+/// from `(B, A)`).
+fn update_pair_basis_stats(runtime: &mut RuntimeState, prices: &[PriceRow]) {
+    for buy in prices {
+        if !buy.ok || buy.tier != VenueTier::UsdtLinearPerp {
+            continue;
+        }
+        let Some(buy_ask) = buy.ask else { continue };
+        for sell in prices {
+            if buy.id == sell.id {
+                continue;
+            }
+            if !sell.ok || sell.tier != VenueTier::UsdtLinearPerp {
+                continue;
+            }
+            let Some(sell_bid) = sell.bid else { continue };
+            let gross = sell_bid - buy_ask;
+            if !gross.is_finite() {
+                continue;
+            }
+            let key = format!("{}>{}", buy.name, sell.name);
+            runtime
+                .pair_basis_stats
+                .entry(key)
+                .or_default()
+                .update(gross);
+        }
+    }
+}
+
 fn maybe_open_position(
     runtime: &mut RuntimeState,
     depth: &DepthSimulation,
@@ -1607,6 +1699,32 @@ fn maybe_open_position(
     ) else {
         return;
     };
+
+    // Basis filter: gate on statistical significance vs typical spread.
+    //
+    // Each pair carries its own characteristic gross spread (book skew,
+    // funding-implied carry, micro-structure). Trading the raw spread
+    // means routinely opening into typical levels that don't have any
+    // mean-reverting force above what the fees already account for.
+    //
+    // We require the depth-walked entry spread to exceed the rolling
+    // EMA by `BASIS_K_SIGMA` standard deviations before allowing an
+    // open. Until the EMA has seen `BASIS_WARMUP_SAMPLES` ticks for
+    // this pair, we conservatively block opens.
+    let basis_key = format!("{buy_name}>{sell_name}");
+    let entry_gross = entry_sell_price - entry_buy_price;
+    if let Some(stats) = runtime.pair_basis_stats.get(&basis_key) {
+        if !stats.is_warm() {
+            return;
+        }
+        let threshold = stats.ema + BASIS_K_SIGMA * stats.stddev();
+        if entry_gross < threshold {
+            return;
+        }
+    } else {
+        return;
+    }
+
     let id = format!(
         "pos-{}-{}-{}",
         buy_name.to_lowercase().replace(' ', "-"),
