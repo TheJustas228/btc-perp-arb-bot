@@ -1537,8 +1537,22 @@ fn evaluate_position(position: &OpenPosition, books: &[Book]) -> Option<Position
     })
 }
 
+/// Direction-symmetric pair key.
+///
+/// Used to gate `RuntimeState::open_position_keys` so that we cannot
+/// hold two opposite positions on the same venue pair at once. The
+/// previous implementation used `format!("{buy}>{sell}")` which made
+/// `A>B` and `B>A` distinct keys, allowing the bot to open a long-A
+/// /short-B position alongside a long-B/short-A position on the next
+/// tick when the basis flickered. Those two positions are by
+/// construction the same exposure with opposite signs and just bleed
+/// fees against each other.
 fn pair_key(buy_exchange: &str, sell_exchange: &str) -> String {
-    format!("{}>{}", buy_exchange, sell_exchange)
+    if buy_exchange <= sell_exchange {
+        format!("{buy_exchange}<>{sell_exchange}")
+    } else {
+        format!("{sell_exchange}<>{buy_exchange}")
+    }
 }
 
 fn maybe_open_position(
