@@ -1,6 +1,7 @@
 target/
 node_modules/
 data/interesting-opportunities.json
+data/closed-trades.jsonl
 .agents/
 .codex/
 .env

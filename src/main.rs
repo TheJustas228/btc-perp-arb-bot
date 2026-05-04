@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    io::Write,
     net::SocketAddr,
     path::Path,
     sync::Arc,
@@ -41,20 +42,20 @@ const POSITION_TIMEOUT_TICKS: u32 = 120;
 /// EMA smoothing factor for the per-pair basis (TOB gross spread).
 /// 0.05 corresponds to ~20-poll half-life, ~30s at the default 1.5s poll.
 const BASIS_EMA_ALPHA: f64 = 0.05;
-/// Number of polls a pair must be observed before the basis filter
-/// will gate decisions on it. Below this we have no reliable estimate
-/// of the typical spread.
-const BASIS_WARMUP_SAMPLES: u64 = 60;
+/// Polls before the basis filter applies per pair. Below this we have no
+/// reliable σ; lowered for faster warmup while collecting `closed-trades.jsonl`.
+const BASIS_WARMUP_SAMPLES: u64 = 36;
 /// Number of standard deviations above the EMA the current spread must
 /// reach before a position is allowed to open. Larger = stricter.
-const BASIS_K_SIGMA: f64 = 1.5;
-/// "Shock-only mode": require a more extreme spread than the baseline
-/// basis filter before opening. 2.0 sigma above the EMA is stricter than
-/// the baseline 1.5 sigma gate but looser than the previous 2.5 sigma.
-const SHOCK_BASIS_K_SIGMA: f64 = 2.0;
+const BASIS_K_SIGMA: f64 = 1.2;
+/// Second σ gate kept equal to [`BASIS_K_SIGMA`] so we do not require a
+/// strictly wider shock than the baseline (that silently negated loosening
+/// the first gate). Tighten this above `BASIS_K_SIGMA` again when you want
+/// shock-only entries.
+const SHOCK_BASIS_K_SIGMA: f64 = BASIS_K_SIGMA;
 /// Require entry estimated net to be at least this multiple of expected
 /// round-trip fees. Prevents entering tiny edges where fee drag dominates.
-const MIN_NET_TO_FEE_MULTIPLIER: f64 = 2.0;
+const MIN_NET_TO_FEE_MULTIPLIER: f64 = 1.35;
 /// Conservative haircut from estimated entry net to expected realized net.
 /// Derived from observed realized-vs-estimated slippage in this strategy.
 const EXPECTED_REALIZED_HAIRCUT: f64 = 0.50;
@@ -65,6 +66,8 @@ const ROUTE_QUALITY_MIN_REALIZATION: f64 = 0.25;
 /// Route must keep positive expectancy once warm.
 const ROUTE_QUALITY_MIN_AVG_NET: f64 = 0.0;
 const RECORDS_PATH: &str = "data/interesting-opportunities.json";
+/// Append-only log of simulated closes for offline analysis (`scripts/analyze_closed_trades.py`).
+const CLOSED_TRADES_LOG_PATH: &str = "data/closed-trades.jsonl";
 
 #[derive(Clone)]
 struct Exchange {
@@ -557,6 +560,7 @@ struct SettingsPayload {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = dotenvy::dotenv();
     let poll_ms = env_u64("POLL_MS", 1500).max(POLL_MS_MIN);
     let timeout_ms = env_u64("REQUEST_TIMEOUT_MS", 2000).max(REQUEST_TIMEOUT_MS_MIN);
     let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -621,6 +625,9 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("BTC/USDT spread app running at http://{addr}");
     println!("Polling {} exchanges every {poll_ms}ms", exchanges.len());
+    println!(
+        "Simulated closes append to {CLOSED_TRADES_LOG_PATH} (analyze with scripts/analyze_closed_trades.py)"
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -2028,6 +2035,7 @@ fn update_open_positions(runtime: &mut RuntimeState, books: &[Book]) {
 
     runtime.open_positions = still_open;
     for trade in newly_closed {
+        append_closed_trade_log(&trade);
         let route_key = format!("{}->{}", trade.buy_exchange, trade.sell_exchange);
         runtime
             .route_quality_stats
@@ -2037,6 +2045,20 @@ fn update_open_positions(runtime: &mut RuntimeState, books: &[Book]) {
         runtime.closed_trades.insert(0, trade);
     }
     runtime.closed_trades.truncate(MAX_CLOSED_TRADES);
+}
+
+fn append_closed_trade_log(trade: &ClosedTrade) {
+    let Ok(line) = serde_json::to_string(trade) else {
+        return;
+    };
+    if let Some(parent) = Path::new(CLOSED_TRADES_LOG_PATH).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(CLOSED_TRADES_LOG_PATH)
+        .and_then(|mut f| writeln!(f, "{line}"));
 }
 
 fn record_visible_depth_net(runtime: &mut RuntimeState, scenarios: &[DepthSimulation]) -> bool {
@@ -2252,6 +2274,9 @@ fn account_sizing(
 
 fn exchanges() -> Vec<Exchange> {
     use VenueTier::*;
+    // MEXC account taker rate varies by promo / account; live UI often shows 0.01%,
+    // demo ~0.02%. Override with MEXC_FUTURES_TAKER_FEE (decimal, e.g. 0.0002).
+    let mexc_taker = env_fee_rate("MEXC_FUTURES_TAKER_FEE", 0.0001);
     vec![
         // ---- Tier: USDT-margined linear perpetuals (executable arb candidates) ----
         ex("binance", "Binance Futures", 0.0005, UsdtLinearPerp, "https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol=BTCUSDT", Some("https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=100")),
@@ -2259,8 +2284,7 @@ fn exchanges() -> Vec<Exchange> {
         ex("bybit", "Bybit Linear", 0.00055, UsdtLinearPerp, "https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT", Some("https://api.bybit.com/v5/market/orderbook?category=linear&symbol=BTCUSDT&limit=100")),
         ex("gateio", "Gate.io Futures", 0.0005, UsdtLinearPerp, "https://api.gateio.ws/api/v4/futures/usdt/tickers?contract=BTC_USDT", Some("https://api.gateio.ws/api/v4/futures/usdt/order_book?contract=BTC_USDT&limit=100")),
         ex("bitget", "Bitget Futures", 0.0006, UsdtLinearPerp, "https://api.bitget.com/api/v2/mix/market/ticker?productType=USDT-FUTURES&symbol=BTCUSDT", Some("https://api.bitget.com/api/v2/mix/market/orderbook?symbol=BTCUSDT&productType=USDT-FUTURES&limit=100")),
-        // MEXC: API taker fee is 0.05% even though web/app shows 0.01% for BTC futures takers.
-        ex("mexc", "MEXC Futures", 0.0005, UsdtLinearPerp, "https://contract.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT", Some("https://contract.mexc.com/api/v1/contract/depth/BTC_USDT?limit=100")),
+        ex("mexc", "MEXC Futures", mexc_taker, UsdtLinearPerp, "https://contract.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT", Some("https://contract.mexc.com/api/v1/contract/depth/BTC_USDT?limit=100")),
         // Re-enabled by user request: include Bitfinex route in executable stack.
         ex("phemex", "Phemex Perp", 0.0006, UsdtLinearPerp, "https://api.phemex.com/md/v2/orderbook?symbol=BTCUSDT", Some("https://api.phemex.com/md/v2/orderbook?symbol=BTCUSDT")),
         ex("poloniex", "Poloniex Futures", 0.0006, UsdtLinearPerp, "https://api.poloniex.com/v3/market/tickers?symbol=BTC_USDT_PERP", Some("https://api.poloniex.com/v3/market/orderBook?symbol=BTC_USDT_PERP&limit=50")),
@@ -2334,6 +2358,15 @@ fn env_u16(key: &str, default: u16) -> u16 {
     std::env::var(key)
         .ok()
         .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Parsed taker fee as a fraction (e.g. `0.0001` == 0.01%). Used for venue-specific overrides.
+fn env_fee_rate(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0 && *v <= 0.05)
         .unwrap_or(default)
 }
 
