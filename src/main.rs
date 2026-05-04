@@ -27,8 +27,17 @@ const MAX_PAPER_CHECKS: usize = 100;
 const MAX_FAKE_TRADES: usize = 20;
 const MAX_OPEN_POSITIONS: usize = 50;
 const MAX_CLOSED_TRADES: usize = 100;
-const POSITION_CLOSE_TRIGGER: f64 = 0.0;
-const POSITION_TIMEOUT_TICKS: u32 = 600;
+/// Take profit when mark-to-market unrealized net reaches this fraction
+/// of the entry-time estimated edge (e.g. 0.5 means close as soon as
+/// half the entry edge is realized).
+const POSITION_TAKE_PROFIT_FRACTION: f64 = 0.5;
+/// Stop loss when unrealized net reaches this multiple of the entry-time
+/// estimated edge in the wrong direction (e.g. -1.0 means close once we
+/// have lost as much as the original projected gain).
+const POSITION_STOP_LOSS_FRACTION: f64 = -1.0;
+/// Hard time stop. Far shorter than the previous 600 ticks because basis
+/// trades that haven't moved in a couple of minutes statistically don't.
+const POSITION_TIMEOUT_TICKS: u32 = 120;
 const RECORDS_PATH: &str = "data/interesting-opportunities.json";
 
 #[derive(Clone)]
@@ -1667,11 +1676,36 @@ fn update_open_positions(runtime: &mut RuntimeState, books: &[Book]) {
                 position.current_trigger_spread = Some(eval.trigger_spread);
                 position.current_unrealized_net = Some(eval.realized_net);
 
-                let converged = eval.trigger_spread <= POSITION_CLOSE_TRIGGER;
+                // P/L-based close triggers, expressed as fractions of the
+                // entry-time estimated edge so they scale with trade size:
+                //   * take profit at >= 50% of the projected edge
+                //   * stop loss at -100% of the projected edge
+                //   * hard time stop at POSITION_TIMEOUT_TICKS
+                //
+                // The previous TOB-cross trigger (sell_bid - buy_ask <= 0)
+                // was wrong for two reasons. First, it used the *re-open*
+                // direction, not the *close* direction, so the bot would
+                // sit in a deeply profitable position waiting for the
+                // open-direction spread to cross. Second, against
+                // venues with structural basis the trigger never fires.
+                let estimated = position.entry_estimated_net.abs().max(1e-6);
+                let take_profit_target = POSITION_TAKE_PROFIT_FRACTION * estimated;
+                let stop_loss_target = POSITION_STOP_LOSS_FRACTION * estimated;
+                let take_profit_hit = eval.realized_net >= take_profit_target;
+                let stop_loss_hit = eval.realized_net <= stop_loss_target;
                 let timed_out = position.ticks_held >= POSITION_TIMEOUT_TICKS;
 
-                if converged || timed_out {
-                    let reason = if converged { "Converged" } else { "Timeout" };
+                let close_reason = if take_profit_hit {
+                    Some("Take profit")
+                } else if stop_loss_hit {
+                    Some("Stop loss")
+                } else if timed_out {
+                    Some("Timeout")
+                } else {
+                    None
+                };
+
+                if let Some(reason) = close_reason {
                     let trade = build_closed_trade(&position, &eval, reason);
                     runtime.realized_cumulative_net += trade.realized_net;
                     runtime
