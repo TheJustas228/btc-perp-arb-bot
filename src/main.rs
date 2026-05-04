@@ -38,6 +38,31 @@ struct Exchange {
     fee_rate: f64,
     ticker_url: &'static str,
     depth_url: Option<&'static str>,
+    /// Settlement-asset tier the venue belongs to.
+    ///
+    /// Only [`VenueTier::UsdtLinearPerp`] venues are eligible to be the
+    /// buy or sell leg of an executable arb. Other tiers (different
+    /// settlement asset, persistent basis, or wide internal book) stay
+    /// in the price matrix as a reference but never feed into
+    /// `find_executable_scenarios_for_opportunities`.
+    tier: VenueTier,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
+enum VenueTier {
+    /// Linear perpetuals quoted and margined in USDT (or near-USDT
+    /// equivalents like UST). All routes between two venues in this
+    /// tier are tradeable in principle.
+    UsdtLinearPerp,
+    /// Settlement asset differs from USDT (USTF0, USD, USDC, etc.) so
+    /// the cross-venue spread carries a structural basis that doesn't
+    /// reliably mean-revert. Useful as a price reference, never as an
+    /// executable leg.
+    DifferentSettlement,
+    /// Internal book is structurally wide or contract semantics differ
+    /// enough (contract multipliers, illiquid top-of-book, etc.) that
+    /// the displayed mid is misleading for execution. Reference only.
+    UnreliableBook,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -49,12 +74,21 @@ struct PriceRow {
     ask: Option<f64>,
     #[serde(rename = "feeRate")]
     fee_rate: f64,
+    /// Settlement-asset tier of the venue. Only `UsdtLinearPerp` rows
+    /// are considered when generating executable arb candidates;
+    /// other tiers stay in the price matrix as a reference.
+    #[serde(default = "default_tier")]
+    tier: VenueTier,
     ok: bool,
     error: Option<String>,
     #[serde(rename = "updatedAt")]
     updated_at: Option<String>,
     #[serde(rename = "latencyMs")]
     latency_ms: Option<u128>,
+}
+
+fn default_tier() -> VenueTier {
+    VenueTier::UsdtLinearPerp
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -321,6 +355,7 @@ struct Level {
 struct Book {
     name: String,
     fee_rate: f64,
+    tier: VenueTier,
     asks: Vec<Level>,
     bids: Vec<Level>,
 }
@@ -718,6 +753,7 @@ async fn fetch_ticker(client: Client, exchange: Exchange) -> PriceRow {
             bid,
             ask,
             fee_rate: exchange.fee_rate,
+            tier: exchange.tier,
             ok: true,
             error: None,
             updated_at: Some(now()),
@@ -736,6 +772,7 @@ fn failed_price(exchange: &Exchange, started: std::time::Instant, error: &str) -
         bid: None,
         ask: None,
         fee_rate: exchange.fee_rate,
+        tier: exchange.tier,
         ok: false,
         error: Some(error.to_string()),
         updated_at: Some(now()),
@@ -776,6 +813,7 @@ async fn fetch_depth(client: Client, exchange: Exchange) -> Option<Book> {
     Some(Book {
         name: exchange.name.to_string(),
         fee_rate: exchange.fee_rate,
+        tier: exchange.tier,
         asks,
         bids,
     })
@@ -798,6 +836,7 @@ async fn fetch_bitfinex_ticker_book(client: Client, exchange: Exchange) -> Optio
     Some(Book {
         name: exchange.name.to_string(),
         fee_rate: exchange.fee_rate,
+        tier: exchange.tier,
         asks: vec![Level {
             price: ask,
             amount: ask_size,
@@ -1205,6 +1244,14 @@ fn find_best_depth_size_for_opportunity(
     max_size: f64,
 ) -> Option<DepthSimulation> {
     let (buy, sell) = books_for_opportunity(books, opportunity)?;
+    // Only USDT-margined linear-perp venues are ever an executable leg.
+    // Other tiers (different settlement asset, unreliable internal book)
+    // stay in the "Arbitrage Opportunities" feed for transparency but
+    // never produce a depth scenario, so they can't trigger a position
+    // open or contribute to cumulative depth net.
+    if buy.tier != VenueTier::UsdtLinearPerp || sell.tier != VenueTier::UsdtLinearPerp {
+        return None;
+    }
     simulate_profitable_size_for_pair(buy, sell, max_size)
 }
 
@@ -1817,6 +1864,7 @@ fn initial_snapshot(poll_ms: u64, exchanges: &[Exchange], stored: &StoredRecords
                 bid: None,
                 ask: None,
                 fee_rate: e.fee_rate,
+                tier: e.tier,
                 ok: false,
                 error: Some("Waiting for first poll".to_string()),
                 updated_at: None,
@@ -1872,27 +1920,37 @@ fn account_sizing(
 }
 
 fn exchanges() -> Vec<Exchange> {
+    use VenueTier::*;
     vec![
-        ex("binance", "Binance Futures", 0.0005, "https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol=BTCUSDT", Some("https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=100")),
-        ex("okx", "OKX Swap", 0.0005, "https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT-SWAP", Some("https://www.okx.com/api/v5/market/books?instId=BTC-USDT-SWAP&sz=100")),
-        ex("bybit", "Bybit Linear", 0.00055, "https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT", Some("https://api.bybit.com/v5/market/orderbook?category=linear&symbol=BTCUSDT&limit=100")),
-        ex("kucoin", "KuCoin Futures", 0.0006, "https://api-futures.kucoin.com/api/v1/ticker?symbol=XBTUSDTM", Some("https://api-futures.kucoin.com/api/v1/level2/depth100?symbol=XBTUSDTM")),
-        ex("gateio", "Gate.io Futures", 0.0005, "https://api.gateio.ws/api/v4/futures/usdt/tickers?contract=BTC_USDT", Some("https://api.gateio.ws/api/v4/futures/usdt/order_book?contract=BTC_USDT&limit=100")),
-        ex("bitget", "Bitget Futures", 0.0006, "https://api.bitget.com/api/v2/mix/market/ticker?productType=USDT-FUTURES&symbol=BTCUSDT", Some("https://api.bitget.com/api/v2/mix/market/orderbook?symbol=BTCUSDT&productType=USDT-FUTURES&limit=100")),
-        // MEXC: web/app shows 0.01% taker, but API trading is charged a separate fee tier.
-        // Per MEXC's own API key creation page tip text:
-        //   "even if Web/App BTC Futures fees are 0% for makers and 0.01% for takers,
-        //    API trades will still be charged 0.01% maker and 0.05% taker fees."
-        // We always take liquidity, so 0.0005 is the correct value here.
-        ex("mexc", "MEXC Futures", 0.0005, "https://contract.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT", Some("https://contract.mexc.com/api/v1/contract/depth/BTC_USDT?limit=100")),
-        ex("kraken", "Kraken Futures", 0.0005, "https://futures.kraken.com/derivatives/api/v3/tickers?symbol=PF_XBTUSD", Some("https://futures.kraken.com/derivatives/api/v3/orderbook?symbol=PF_XBTUSD")),
-        ex("bitfinex", "Bitfinex Derivatives", 0.0, "https://api-pub.bitfinex.com/v2/ticker/tBTCF0:USTF0", Some("https://api-pub.bitfinex.com/v2/book/tBTCF0:USTF0/P0?len=25")),
-        ex("cryptocom", "Crypto.com Derivatives", 0.0005, "https://api.crypto.com/exchange/v1/public/get-tickers?instrument_name=BTCUSD-PERP", Some("https://api.crypto.com/exchange/v1/public/get-book?instrument_name=BTCUSD-PERP&depth=50")),
-        ex("phemex", "Phemex Perp", 0.0006, "https://api.phemex.com/md/v2/orderbook?symbol=BTCUSDT", Some("https://api.phemex.com/md/v2/orderbook?symbol=BTCUSDT")),
-        ex("whitebit", "WhiteBIT Futures", 0.00035, "https://whitebit.com/api/v4/public/orderbook/BTC_PERP?limit=50", Some("https://whitebit.com/api/v4/public/orderbook/BTC_PERP?limit=50")),
-        ex("poloniex", "Poloniex Futures", 0.0006, "https://api.poloniex.com/v3/market/tickers?symbol=BTC_USDT_PERP", Some("https://api.poloniex.com/v3/market/orderBook?symbol=BTC_USDT_PERP&limit=50")),
-        ex("htx", "HTX Swap", 0.0005, "https://api.hbdm.com/linear-swap-ex/market/detail/merged?contract_code=BTC-USDT", Some("https://api.hbdm.com/linear-swap-ex/market/depth?contract_code=BTC-USDT&type=step0")),
-        ex("bingx", "BingX Swap", 0.0005, "https://open-api.bingx.com/openApi/swap/v2/quote/ticker?symbol=BTC-USDT", Some("https://open-api.bingx.com/openApi/swap/v2/quote/depth?symbol=BTC-USDT&limit=100")),
+        // ---- Tier: USDT-margined linear perpetuals (executable arb candidates) ----
+        ex("binance", "Binance Futures", 0.0005, UsdtLinearPerp, "https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol=BTCUSDT", Some("https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=100")),
+        ex("okx", "OKX Swap", 0.0005, UsdtLinearPerp, "https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT-SWAP", Some("https://www.okx.com/api/v5/market/books?instId=BTC-USDT-SWAP&sz=100")),
+        ex("bybit", "Bybit Linear", 0.00055, UsdtLinearPerp, "https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT", Some("https://api.bybit.com/v5/market/orderbook?category=linear&symbol=BTCUSDT&limit=100")),
+        ex("gateio", "Gate.io Futures", 0.0005, UsdtLinearPerp, "https://api.gateio.ws/api/v4/futures/usdt/tickers?contract=BTC_USDT", Some("https://api.gateio.ws/api/v4/futures/usdt/order_book?contract=BTC_USDT&limit=100")),
+        ex("bitget", "Bitget Futures", 0.0006, UsdtLinearPerp, "https://api.bitget.com/api/v2/mix/market/ticker?productType=USDT-FUTURES&symbol=BTCUSDT", Some("https://api.bitget.com/api/v2/mix/market/orderbook?symbol=BTCUSDT&productType=USDT-FUTURES&limit=100")),
+        // MEXC: API taker fee is 0.05% even though web/app shows 0.01% for BTC futures takers.
+        ex("mexc", "MEXC Futures", 0.0005, UsdtLinearPerp, "https://contract.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT", Some("https://contract.mexc.com/api/v1/contract/depth/BTC_USDT?limit=100")),
+        ex("phemex", "Phemex Perp", 0.0006, UsdtLinearPerp, "https://api.phemex.com/md/v2/orderbook?symbol=BTCUSDT", Some("https://api.phemex.com/md/v2/orderbook?symbol=BTCUSDT")),
+        ex("poloniex", "Poloniex Futures", 0.0006, UsdtLinearPerp, "https://api.poloniex.com/v3/market/tickers?symbol=BTC_USDT_PERP", Some("https://api.poloniex.com/v3/market/orderBook?symbol=BTC_USDT_PERP&limit=50")),
+        ex("htx", "HTX Swap", 0.0005, UsdtLinearPerp, "https://api.hbdm.com/linear-swap-ex/market/detail/merged?contract_code=BTC-USDT", Some("https://api.hbdm.com/linear-swap-ex/market/depth?contract_code=BTC-USDT&type=step0")),
+        ex("bingx", "BingX Swap", 0.0005, UsdtLinearPerp, "https://open-api.bingx.com/openApi/swap/v2/quote/ticker?symbol=BTC-USDT", Some("https://open-api.bingx.com/openApi/swap/v2/quote/depth?symbol=BTC-USDT&limit=100")),
+
+        // ---- Tier: different settlement asset (price-feed only) ----
+        // Bitfinex BTCF0:USTF0 settles in USTF0 (Bitfinex's tether-like internal token).
+        // The pair carries a persistent ~$80 basis vs USDT-perps that does not mean-revert.
+        ex("bitfinex", "Bitfinex Derivatives", 0.0, DifferentSettlement, "https://api-pub.bitfinex.com/v2/ticker/tBTCF0:USTF0", Some("https://api-pub.bitfinex.com/v2/book/tBTCF0:USTF0/P0?len=25")),
+        // Kraken PF_XBTUSD is USD-margined, not USDT-margined.
+        ex("kraken", "Kraken Futures", 0.0005, DifferentSettlement, "https://futures.kraken.com/derivatives/api/v3/tickers?symbol=PF_XBTUSD", Some("https://futures.kraken.com/derivatives/api/v3/orderbook?symbol=PF_XBTUSD")),
+        // Crypto.com BTCUSD-PERP is USD-quoted on their own settlement.
+        ex("cryptocom", "Crypto.com Derivatives", 0.0005, DifferentSettlement, "https://api.crypto.com/exchange/v1/public/get-tickers?instrument_name=BTCUSD-PERP", Some("https://api.crypto.com/exchange/v1/public/get-book?instrument_name=BTCUSD-PERP&depth=50")),
+
+        // ---- Tier: unreliable book (price-feed only) ----
+        // KuCoin XBTUSDTM has shown a persistent ~$25 mark premium vs the USDT cluster
+        // that we have no model for; treat as reference until that's understood.
+        ex("kucoin", "KuCoin Futures", 0.0006, UnreliableBook, "https://api-futures.kucoin.com/api/v1/ticker?symbol=XBTUSDTM", Some("https://api-futures.kucoin.com/api/v1/level2/depth100?symbol=XBTUSDTM")),
+        // WhiteBIT BTC_PERP routinely shows a 30+ USD intra-book bid-ask spread,
+        // wider than any cross-venue edge we'd ever capture.
+        ex("whitebit", "WhiteBIT Futures", 0.00035, UnreliableBook, "https://whitebit.com/api/v4/public/orderbook/BTC_PERP?limit=50", Some("https://whitebit.com/api/v4/public/orderbook/BTC_PERP?limit=50")),
     ]
 }
 
@@ -1900,6 +1958,7 @@ fn ex(
     id: &'static str,
     name: &'static str,
     fee_rate: f64,
+    tier: VenueTier,
     ticker_url: &'static str,
     depth_url: Option<&'static str>,
 ) -> Exchange {
@@ -1909,6 +1968,7 @@ fn ex(
         fee_rate,
         ticker_url,
         depth_url,
+        tier,
     }
 }
 
