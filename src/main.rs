@@ -31,14 +31,16 @@ const MAX_CLOSED_TRADES: usize = 100;
 /// Take profit when mark-to-market unrealized net reaches this fraction
 /// of the entry-time estimated edge (e.g. 0.5 means close as soon as
 /// half the entry edge is realized).
-const POSITION_TAKE_PROFIT_FRACTION: f64 = 0.5;
+/// Slightly earlier banked profit so fee drag on slow mean-reversion
+/// does not dominate as often before timeout.
+const POSITION_TAKE_PROFIT_FRACTION: f64 = 0.42;
 /// Stop loss when unrealized net reaches this multiple of the entry-time
 /// estimated edge in the wrong direction (e.g. -1.0 means close once we
 /// have lost as much as the original projected gain).
 const POSITION_STOP_LOSS_FRACTION: f64 = -1.0;
 /// Hard time stop. Far shorter than the previous 600 ticks because basis
 /// trades that haven't moved in a couple of minutes statistically don't.
-const POSITION_TIMEOUT_TICKS: u32 = 120;
+const POSITION_TIMEOUT_TICKS: u32 = 90;
 /// EMA smoothing factor for the per-pair basis (TOB gross spread).
 /// 0.05 corresponds to ~20-poll half-life, ~30s at the default 1.5s poll.
 const BASIS_EMA_ALPHA: f64 = 0.05;
@@ -48,11 +50,9 @@ const BASIS_WARMUP_SAMPLES: u64 = 36;
 /// Number of standard deviations above the EMA the current spread must
 /// reach before a position is allowed to open. Larger = stricter.
 const BASIS_K_SIGMA: f64 = 1.2;
-/// Second σ gate kept equal to [`BASIS_K_SIGMA`] so we do not require a
-/// strictly wider shock than the baseline (that silently negated loosening
-/// the first gate). Tighten this above `BASIS_K_SIGMA` again when you want
-/// shock-only entries.
-const SHOCK_BASIS_K_SIGMA: f64 = BASIS_K_SIGMA;
+/// Second σ gate on the same top-of-book spread scale as [`BASIS_K_SIGMA`],
+/// slightly stricter so not every TOB spike becomes an open.
+const SHOCK_BASIS_K_SIGMA: f64 = 1.35;
 /// Require entry estimated net to be at least this multiple of expected
 /// round-trip fees. Prevents entering tiny edges where fee drag dominates.
 const MIN_NET_TO_FEE_MULTIPLIER: f64 = 1.35;
@@ -60,9 +60,9 @@ const MIN_NET_TO_FEE_MULTIPLIER: f64 = 1.35;
 /// Derived from observed realized-vs-estimated slippage in this strategy.
 const EXPECTED_REALIZED_HAIRCUT: f64 = 0.50;
 /// Route quality gate activates after this many closed trades per route.
-const ROUTE_QUALITY_MIN_SAMPLES: u32 = 5;
+const ROUTE_QUALITY_MIN_SAMPLES: u32 = 10;
 /// Route must keep realized/estimated ratio above this floor once warm.
-const ROUTE_QUALITY_MIN_REALIZATION: f64 = 0.25;
+const ROUTE_QUALITY_MIN_REALIZATION: f64 = 0.2;
 /// Route must keep positive expectancy once warm.
 const ROUTE_QUALITY_MIN_AVG_NET: f64 = 0.0;
 const RECORDS_PATH: &str = "data/interesting-opportunities.json";
@@ -1818,20 +1818,26 @@ fn maybe_open_position(
         return;
     };
 
-    // Basis filter: gate on statistical significance vs typical spread.
+    // Basis filter: statistical significance vs typical **top-of-book** spread.
     //
-    // Each pair carries its own characteristic gross spread (book skew,
-    // funding-implied carry, micro-structure). Trading the raw spread
-    // means routinely opening into typical levels that don't have any
-    // mean-reverting force above what the fees already account for.
-    //
-    // We require the depth-walked entry spread to exceed the rolling
-    // EMA by `BASIS_K_SIGMA` standard deviations before allowing an
-    // open. Until the EMA has seen `BASIS_WARMUP_SAMPLES` ticks for
-    // this pair, we conservatively block opens.
+    // `update_pair_basis_stats` records `sell_bid - buy_ask` from tickers.
+    // Previously we compared that EMA+σ to the **depth-walked** average
+    // spread, which is systematically tighter — the σ gate was miscalibrated
+    // and biased toward marginal fills that then died in fees at timeout.
+    // Depth economics stay enforced by `estimated_net_profit` + fee gates.
     let basis_key = format!("{buy_name}>{sell_name}");
     let route_key = format!("{buy_name}->{sell_name}");
-    let entry_gross = entry_sell_price - entry_buy_price;
+    let (Some(tob_buy_ask), Some(tob_sell_bid)) =
+        (buy_book.asks.first(), sell_book.bids.first())
+    else {
+        OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_missing_depth_fields);
+        return;
+    };
+    let tob_gross = tob_sell_bid.price - tob_buy_ask.price;
+    if !tob_gross.is_finite() {
+        OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_basis_missing);
+        return;
+    }
     if let Some(stats) = runtime.pair_basis_stats.get(&basis_key) {
         if !stats.is_warm() {
             OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_basis_not_warm);
@@ -1839,11 +1845,11 @@ fn maybe_open_position(
         }
         let threshold = stats.ema + BASIS_K_SIGMA * stats.stddev();
         let shock_threshold = stats.ema + SHOCK_BASIS_K_SIGMA * stats.stddev();
-        if entry_gross < threshold {
+        if tob_gross < threshold {
             OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_basis_threshold);
             return;
         }
-        if entry_gross < shock_threshold {
+        if tob_gross < shock_threshold {
             OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_shock_threshold);
             return;
         }
