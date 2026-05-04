@@ -47,11 +47,11 @@ const BASIS_EMA_ALPHA: f64 = 0.05;
 const BASIS_WARMUP_SAMPLES: u64 = 60;
 /// Number of standard deviations above the EMA the current spread must
 /// reach before a position is allowed to open. Larger = stricter.
-const BASIS_K_SIGMA: f64 = 2.0;
+const BASIS_K_SIGMA: f64 = 1.5;
 /// "Shock-only mode": require a more extreme spread than the baseline
-/// basis filter before opening. 2.5 sigma keeps rare dislocations while
-/// allowing a bit more frequency than 3.0 sigma.
-const SHOCK_BASIS_K_SIGMA: f64 = 2.5;
+/// basis filter before opening. 2.0 sigma above the EMA is stricter than
+/// the baseline 1.5 sigma gate but looser than the previous 2.5 sigma.
+const SHOCK_BASIS_K_SIGMA: f64 = 2.0;
 /// Require entry estimated net to be at least this multiple of expected
 /// round-trip fees. Prevents entering tiny edges where fee drag dominates.
 const MIN_NET_TO_FEE_MULTIPLIER: f64 = 2.0;
@@ -362,6 +362,8 @@ struct Snapshot {
     realized_cumulative_net: f64,
     #[serde(rename = "realizedTradesResetAt")]
     realized_trades_reset_at: String,
+    #[serde(rename = "openDecisionStats")]
+    open_decision_stats: OpenDecisionStats,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -428,6 +430,8 @@ struct RuntimeState {
     pair_basis_stats: HashMap<String, BasisStats>,
     /// Rolling quality stats per directional route "buy->sell".
     route_quality_stats: HashMap<String, RouteQualityStats>,
+    /// Live counters of open-attempt decisions by gate/reason.
+    open_decision_stats: OpenDecisionStats,
 }
 
 #[derive(Clone, Default)]
@@ -505,6 +509,44 @@ impl RouteQualityStats {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize, Default)]
+struct OpenDecisionStats {
+    attempted: u64,
+    opened: u64,
+    #[serde(rename = "rejectNoDepth")]
+    reject_no_depth: u64,
+    #[serde(rename = "rejectPairAlreadyOpen")]
+    reject_pair_already_open: u64,
+    #[serde(rename = "rejectMaxOpenPositions")]
+    reject_max_open_positions: u64,
+    #[serde(rename = "rejectMissingBook")]
+    reject_missing_book: u64,
+    #[serde(rename = "rejectMissingDepthFields")]
+    reject_missing_depth_fields: u64,
+    #[serde(rename = "rejectBasisMissing")]
+    reject_basis_missing: u64,
+    #[serde(rename = "rejectBasisNotWarm")]
+    reject_basis_not_warm: u64,
+    #[serde(rename = "rejectBasisThreshold")]
+    reject_basis_threshold: u64,
+    #[serde(rename = "rejectShockThreshold")]
+    reject_shock_threshold: u64,
+    #[serde(rename = "rejectFeeMultiple")]
+    reject_fee_multiple: u64,
+    #[serde(rename = "rejectHaircut")]
+    reject_haircut: u64,
+    #[serde(rename = "rejectRouteQualityAvg")]
+    reject_route_quality_avg: u64,
+    #[serde(rename = "rejectRouteQualityRealization")]
+    reject_route_quality_realization: u64,
+}
+
+impl OpenDecisionStats {
+    fn bump(value: &mut u64) {
+        *value = value.saturating_add(1);
+    }
+}
+
 #[derive(Deserialize)]
 struct SettingsPayload {
     #[serde(rename = "minDepthNetThreshold")]
@@ -550,6 +592,7 @@ async fn main() -> anyhow::Result<()> {
         realized_trades_reset_at: now(),
         pair_basis_stats: HashMap::new(),
         route_quality_stats: HashMap::new(),
+        open_decision_stats: OpenDecisionStats::default(),
     }));
     let state = AppState {
         snapshot: snapshot.clone(),
@@ -636,6 +679,7 @@ async fn api_reset_realized_trades(State(state): State<AppState>) -> impl IntoRe
         runtime.closed_trades.clear();
         runtime.realized_cumulative_net = 0.0;
         runtime.realized_trades_reset_at = reset_at.clone();
+        runtime.open_decision_stats = OpenDecisionStats::default();
     }
     {
         let mut snapshot = state.snapshot.write().await;
@@ -643,6 +687,7 @@ async fn api_reset_realized_trades(State(state): State<AppState>) -> impl IntoRe
         snapshot.closed_trades.clear();
         snapshot.realized_cumulative_net = 0.0;
         snapshot.realized_trades_reset_at = reset_at.clone();
+        snapshot.open_decision_stats = OpenDecisionStats::default();
     }
     Json(serde_json::json!({ "ok": true, "realizedTradesResetAt": reset_at }))
 }
@@ -752,6 +797,7 @@ async fn poll_loop(
             closed_trades,
             realized_cumulative_net,
             realized_trades_reset_at,
+            open_decision_stats,
         ) = {
             let mut runtime = runtime.write().await;
             update_pair_basis_stats(&mut runtime, &prices);
@@ -827,6 +873,7 @@ async fn poll_loop(
                 runtime.closed_trades.clone(),
                 runtime.realized_cumulative_net,
                 runtime.realized_trades_reset_at.clone(),
+                runtime.open_decision_stats.clone(),
             )
         };
 
@@ -852,6 +899,7 @@ async fn poll_loop(
             closed_trades,
             realized_cumulative_net,
             realized_trades_reset_at,
+            open_decision_stats,
         };
         *snapshot.write().await = new_snapshot;
         sleep(Duration::from_millis(poll_ms)).await;
@@ -1719,27 +1767,33 @@ fn maybe_open_position(
     min_executable_net: f64,
     leverage: f64,
 ) {
+    OpenDecisionStats::bump(&mut runtime.open_decision_stats.attempted);
     if depth.size_btc <= 0.0
         || depth.estimated_net_profit.unwrap_or(0.0) < min_executable_net
     {
+        OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_no_depth);
         return;
     }
     let (Some(buy_name), Some(sell_name)) =
         (depth.buy_exchange.as_deref(), depth.sell_exchange.as_deref())
     else {
+        OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_no_depth);
         return;
     };
     let key = pair_key(buy_name, sell_name);
     if runtime.open_position_keys.contains(&key) {
+        OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_pair_already_open);
         return;
     }
     if runtime.open_positions.len() >= MAX_OPEN_POSITIONS {
+        OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_max_open_positions);
         return;
     }
     let (Some(buy_book), Some(sell_book)) = (
         books.iter().find(|b| b.name == buy_name),
         books.iter().find(|b| b.name == sell_name),
     ) else {
+        OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_missing_book);
         return;
     };
     let (
@@ -1753,6 +1807,7 @@ fn maybe_open_position(
         depth.estimated_fees,
         depth.estimated_net_profit,
     ) else {
+        OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_missing_depth_fields);
         return;
     };
 
@@ -1772,17 +1827,21 @@ fn maybe_open_position(
     let entry_gross = entry_sell_price - entry_buy_price;
     if let Some(stats) = runtime.pair_basis_stats.get(&basis_key) {
         if !stats.is_warm() {
+            OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_basis_not_warm);
             return;
         }
         let threshold = stats.ema + BASIS_K_SIGMA * stats.stddev();
         let shock_threshold = stats.ema + SHOCK_BASIS_K_SIGMA * stats.stddev();
         if entry_gross < threshold {
+            OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_basis_threshold);
             return;
         }
         if entry_gross < shock_threshold {
+            OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_shock_threshold);
             return;
         }
     } else {
+        OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_basis_missing);
         return;
     }
 
@@ -1793,6 +1852,7 @@ fn maybe_open_position(
     if roundtrip_fees.is_finite() && roundtrip_fees > 0.0 {
         let net_to_fee = entry_estimated_net / roundtrip_fees;
         if net_to_fee < MIN_NET_TO_FEE_MULTIPLIER {
+            OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_fee_multiple);
             return;
         }
     }
@@ -1801,6 +1861,7 @@ fn maybe_open_position(
     // realized net still clears the minimum executable net threshold.
     let expected_realized_net = entry_estimated_net * EXPECTED_REALIZED_HAIRCUT;
     if expected_realized_net < min_executable_net {
+        OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_haircut);
         return;
     }
 
@@ -1809,9 +1870,13 @@ fn maybe_open_position(
     if let Some(route_quality) = runtime.route_quality_stats.get(&route_key) {
         if route_quality.is_warm() {
             if route_quality.avg_realized() < ROUTE_QUALITY_MIN_AVG_NET {
+                OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_route_quality_avg);
                 return;
             }
             if route_quality.realization_ratio() < ROUTE_QUALITY_MIN_REALIZATION {
+                OpenDecisionStats::bump(
+                    &mut runtime.open_decision_stats.reject_route_quality_realization,
+                );
                 return;
             }
         }
@@ -1842,6 +1907,7 @@ fn maybe_open_position(
     });
     runtime.open_position_keys.insert(key);
     record_fake_trade(runtime, depth, leverage);
+    OpenDecisionStats::bump(&mut runtime.open_decision_stats.opened);
 }
 
 fn build_closed_trade(
@@ -2152,6 +2218,7 @@ fn initial_snapshot(poll_ms: u64, exchanges: &[Exchange], stored: &StoredRecords
         closed_trades: Vec::new(),
         realized_cumulative_net: 0.0,
         realized_trades_reset_at: now(),
+        open_decision_stats: OpenDecisionStats::default(),
     }
 }
 
@@ -2194,15 +2261,14 @@ fn exchanges() -> Vec<Exchange> {
         ex("bitget", "Bitget Futures", 0.0006, UsdtLinearPerp, "https://api.bitget.com/api/v2/mix/market/ticker?productType=USDT-FUTURES&symbol=BTCUSDT", Some("https://api.bitget.com/api/v2/mix/market/orderbook?symbol=BTCUSDT&productType=USDT-FUTURES&limit=100")),
         // MEXC: API taker fee is 0.05% even though web/app shows 0.01% for BTC futures takers.
         ex("mexc", "MEXC Futures", 0.0005, UsdtLinearPerp, "https://contract.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT", Some("https://contract.mexc.com/api/v1/contract/depth/BTC_USDT?limit=100")),
+        // Re-enabled by user request: include Bitfinex route in executable stack.
         ex("phemex", "Phemex Perp", 0.0006, UsdtLinearPerp, "https://api.phemex.com/md/v2/orderbook?symbol=BTCUSDT", Some("https://api.phemex.com/md/v2/orderbook?symbol=BTCUSDT")),
         ex("poloniex", "Poloniex Futures", 0.0006, UsdtLinearPerp, "https://api.poloniex.com/v3/market/tickers?symbol=BTC_USDT_PERP", Some("https://api.poloniex.com/v3/market/orderBook?symbol=BTC_USDT_PERP&limit=50")),
         ex("htx", "HTX Swap", 0.0005, UsdtLinearPerp, "https://api.hbdm.com/linear-swap-ex/market/detail/merged?contract_code=BTC-USDT", Some("https://api.hbdm.com/linear-swap-ex/market/depth?contract_code=BTC-USDT&type=step0")),
         ex("bingx", "BingX Swap", 0.0005, UsdtLinearPerp, "https://open-api.bingx.com/openApi/swap/v2/quote/ticker?symbol=BTC-USDT", Some("https://open-api.bingx.com/openApi/swap/v2/quote/depth?symbol=BTC-USDT&limit=100")),
+        ex("bitfinex", "Bitfinex Derivatives", 0.0, UsdtLinearPerp, "https://api-pub.bitfinex.com/v2/ticker/tBTCF0:USTF0", Some("https://api-pub.bitfinex.com/v2/book/tBTCF0:USTF0/P0?len=25")),
 
         // ---- Tier: different settlement asset (price-feed only) ----
-        // Bitfinex BTCF0:USTF0 settles in USTF0 (Bitfinex's tether-like internal token).
-        // The pair carries a persistent ~$80 basis vs USDT-perps that does not mean-revert.
-        ex("bitfinex", "Bitfinex Derivatives", 0.0, DifferentSettlement, "https://api-pub.bitfinex.com/v2/ticker/tBTCF0:USTF0", Some("https://api-pub.bitfinex.com/v2/book/tBTCF0:USTF0/P0?len=25")),
         // Kraken PF_XBTUSD is USD-margined, not USDT-margined.
         ex("kraken", "Kraken Futures", 0.0005, DifferentSettlement, "https://futures.kraken.com/derivatives/api/v3/tickers?symbol=PF_XBTUSD", Some("https://futures.kraken.com/derivatives/api/v3/orderbook?symbol=PF_XBTUSD")),
         // Crypto.com BTCUSD-PERP is USD-quoted on their own settlement.
