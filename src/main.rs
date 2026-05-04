@@ -1879,7 +1879,12 @@ fn exchanges() -> Vec<Exchange> {
         ex("kucoin", "KuCoin Futures", 0.0006, "https://api-futures.kucoin.com/api/v1/ticker?symbol=XBTUSDTM", Some("https://api-futures.kucoin.com/api/v1/level2/depth100?symbol=XBTUSDTM")),
         ex("gateio", "Gate.io Futures", 0.0005, "https://api.gateio.ws/api/v4/futures/usdt/tickers?contract=BTC_USDT", Some("https://api.gateio.ws/api/v4/futures/usdt/order_book?contract=BTC_USDT&limit=100")),
         ex("bitget", "Bitget Futures", 0.0006, "https://api.bitget.com/api/v2/mix/market/ticker?productType=USDT-FUTURES&symbol=BTCUSDT", Some("https://api.bitget.com/api/v2/mix/market/orderbook?symbol=BTCUSDT&productType=USDT-FUTURES&limit=100")),
-        ex("mexc", "MEXC Futures", 0.0001, "https://contract.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT", Some("https://contract.mexc.com/api/v1/contract/depth/BTC_USDT?limit=100")),
+        // MEXC: web/app shows 0.01% taker, but API trading is charged a separate fee tier.
+        // Per MEXC's own API key creation page tip text:
+        //   "even if Web/App BTC Futures fees are 0% for makers and 0.01% for takers,
+        //    API trades will still be charged 0.01% maker and 0.05% taker fees."
+        // We always take liquidity, so 0.0005 is the correct value here.
+        ex("mexc", "MEXC Futures", 0.0005, "https://contract.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT", Some("https://contract.mexc.com/api/v1/contract/depth/BTC_USDT?limit=100")),
         ex("kraken", "Kraken Futures", 0.0005, "https://futures.kraken.com/derivatives/api/v3/tickers?symbol=PF_XBTUSD", Some("https://futures.kraken.com/derivatives/api/v3/orderbook?symbol=PF_XBTUSD")),
         ex("bitfinex", "Bitfinex Derivatives", 0.0, "https://api-pub.bitfinex.com/v2/ticker/tBTCF0:USTF0", Some("https://api-pub.bitfinex.com/v2/book/tBTCF0:USTF0/P0?len=25")),
         ex("cryptocom", "Crypto.com Derivatives", 0.0005, "https://api.crypto.com/exchange/v1/public/get-tickers?instrument_name=BTCUSD-PERP", Some("https://api.crypto.com/exchange/v1/public/get-book?instrument_name=BTCUSD-PERP&depth=50")),
