@@ -48,6 +48,22 @@ const BASIS_WARMUP_SAMPLES: u64 = 60;
 /// Number of standard deviations above the EMA the current spread must
 /// reach before a position is allowed to open. Larger = stricter.
 const BASIS_K_SIGMA: f64 = 2.0;
+/// "Shock-only mode": require a more extreme spread than the baseline
+/// basis filter before opening. 2.5 sigma keeps rare dislocations while
+/// allowing a bit more frequency than 3.0 sigma.
+const SHOCK_BASIS_K_SIGMA: f64 = 2.5;
+/// Require entry estimated net to be at least this multiple of expected
+/// round-trip fees. Prevents entering tiny edges where fee drag dominates.
+const MIN_NET_TO_FEE_MULTIPLIER: f64 = 2.0;
+/// Conservative haircut from estimated entry net to expected realized net.
+/// Derived from observed realized-vs-estimated slippage in this strategy.
+const EXPECTED_REALIZED_HAIRCUT: f64 = 0.50;
+/// Route quality gate activates after this many closed trades per route.
+const ROUTE_QUALITY_MIN_SAMPLES: u32 = 5;
+/// Route must keep realized/estimated ratio above this floor once warm.
+const ROUTE_QUALITY_MIN_REALIZATION: f64 = 0.25;
+/// Route must keep positive expectancy once warm.
+const ROUTE_QUALITY_MIN_AVG_NET: f64 = 0.0;
 const RECORDS_PATH: &str = "data/interesting-opportunities.json";
 
 #[derive(Clone)]
@@ -410,6 +426,8 @@ struct RuntimeState {
     /// fresh bid+ask, then read by `maybe_open_position` to gate
     /// on statistical significance vs typical basis.
     pair_basis_stats: HashMap<String, BasisStats>,
+    /// Rolling quality stats per directional route "buy->sell".
+    route_quality_stats: HashMap<String, RouteQualityStats>,
 }
 
 #[derive(Clone, Default)]
@@ -447,6 +465,43 @@ impl BasisStats {
 
     fn is_warm(&self) -> bool {
         self.samples >= BASIS_WARMUP_SAMPLES
+    }
+}
+
+#[derive(Clone, Default)]
+struct RouteQualityStats {
+    samples: u32,
+    wins: u32,
+    sum_realized: f64,
+    sum_estimated: f64,
+}
+
+impl RouteQualityStats {
+    fn update(&mut self, realized_net: f64, entry_estimated_net: f64) {
+        self.samples = self.samples.saturating_add(1);
+        if realized_net > 0.0 {
+            self.wins = self.wins.saturating_add(1);
+        }
+        self.sum_realized += realized_net;
+        self.sum_estimated += entry_estimated_net.max(0.0);
+    }
+
+    fn avg_realized(&self) -> f64 {
+        if self.samples == 0 {
+            return 0.0;
+        }
+        self.sum_realized / self.samples as f64
+    }
+
+    fn realization_ratio(&self) -> f64 {
+        if self.sum_estimated <= 1e-9 {
+            return 0.0;
+        }
+        self.sum_realized / self.sum_estimated
+    }
+
+    fn is_warm(&self) -> bool {
+        self.samples >= ROUTE_QUALITY_MIN_SAMPLES
     }
 }
 
@@ -494,6 +549,7 @@ async fn main() -> anyhow::Result<()> {
         realized_cumulative_net: 0.0,
         realized_trades_reset_at: now(),
         pair_basis_stats: HashMap::new(),
+        route_quality_stats: HashMap::new(),
     }));
     let state = AppState {
         snapshot: snapshot.clone(),
@@ -1712,17 +1768,53 @@ fn maybe_open_position(
     // open. Until the EMA has seen `BASIS_WARMUP_SAMPLES` ticks for
     // this pair, we conservatively block opens.
     let basis_key = format!("{buy_name}>{sell_name}");
+    let route_key = format!("{buy_name}->{sell_name}");
     let entry_gross = entry_sell_price - entry_buy_price;
     if let Some(stats) = runtime.pair_basis_stats.get(&basis_key) {
         if !stats.is_warm() {
             return;
         }
         let threshold = stats.ema + BASIS_K_SIGMA * stats.stddev();
+        let shock_threshold = stats.ema + SHOCK_BASIS_K_SIGMA * stats.stddev();
         if entry_gross < threshold {
+            return;
+        }
+        if entry_gross < shock_threshold {
             return;
         }
     } else {
         return;
+    }
+
+    // Fee-multiple gate: require enough expected edge relative to
+    // round-trip fees. This blocks marginal trades that "look positive"
+    // only because of optimistic top-of-book assumptions.
+    let roundtrip_fees = entry_fees * 2.0;
+    if roundtrip_fees.is_finite() && roundtrip_fees > 0.0 {
+        let net_to_fee = entry_estimated_net / roundtrip_fees;
+        if net_to_fee < MIN_NET_TO_FEE_MULTIPLIER {
+            return;
+        }
+    }
+
+    // Slippage haircut gate: only open if the post-haircut expected
+    // realized net still clears the minimum executable net threshold.
+    let expected_realized_net = entry_estimated_net * EXPECTED_REALIZED_HAIRCUT;
+    if expected_realized_net < min_executable_net {
+        return;
+    }
+
+    // Route-quality gate (after enough samples): skip routes with
+    // negative expectancy or poor realization vs estimated edge.
+    if let Some(route_quality) = runtime.route_quality_stats.get(&route_key) {
+        if route_quality.is_warm() {
+            if route_quality.avg_realized() < ROUTE_QUALITY_MIN_AVG_NET {
+                return;
+            }
+            if route_quality.realization_ratio() < ROUTE_QUALITY_MIN_REALIZATION {
+                return;
+            }
+        }
     }
 
     let id = format!(
@@ -1870,6 +1962,12 @@ fn update_open_positions(runtime: &mut RuntimeState, books: &[Book]) {
 
     runtime.open_positions = still_open;
     for trade in newly_closed {
+        let route_key = format!("{}->{}", trade.buy_exchange, trade.sell_exchange);
+        runtime
+            .route_quality_stats
+            .entry(route_key)
+            .or_default()
+            .update(trade.realized_net, trade.entry_estimated_net);
         runtime.closed_trades.insert(0, trade);
     }
     runtime.closed_trades.truncate(MAX_CLOSED_TRADES);
