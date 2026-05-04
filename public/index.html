@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BTC/USDT Perpetual Spread</title>
+    <link rel="stylesheet" href="/styles.css?v=31" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">BTC/USDT perpetual live spread</p>
+          <h1>Exchange price matrix</h1>
+        </div>
+        <div class="status">
+          <span id="connectionDot" class="dot"></span>
+          <span id="statusText">Starting</span>
+          <label class="statusSwitch">
+            <span>Colorblind mode</span>
+            <input id="colorModeToggle" type="checkbox" />
+            <span class="switchTrack" aria-hidden="true"></span>
+          </label>
+        </div>
+      </header>
+
+      <section class="summary" aria-label="Market summary">
+        <div>
+          <span class="label">Best bid-like price</span>
+          <strong id="bestPrice">--</strong>
+          <span id="bestExchange" class="muted">--</span>
+        </div>
+        <div>
+          <span class="label">Lowest price</span>
+          <strong id="lowPrice">--</strong>
+          <span id="lowExchange" class="muted">--</span>
+        </div>
+        <div>
+          <span class="label">Max spread</span>
+          <strong id="maxSpread">--</strong>
+          <span id="maxSpreadPct" class="muted">--</span>
+        </div>
+        <div>
+          <span class="label">Refresh target</span>
+          <strong id="refreshRate">--</strong>
+          <span class="muted">server poll</span>
+        </div>
+      </section>
+
+      <section class="workspace" aria-label="Exchange comparison table">
+        <div class="tableHeader">
+          <div>
+            <h2>Pairwise price difference</h2>
+            <p>Each cell is row price minus column price. Green is higher, red is lower.</p>
+          </div>
+          <button id="pauseButton" type="button">Pause</button>
+        </div>
+        <div id="tableWrap" class="tableWrap">
+          <div class="loading">Waiting for exchange data...</div>
+        </div>
+      </section>
+
+      <section id="opportunitiesSection" class="workspace" aria-label="Arbitrage opportunities">
+        <div class="tableHeader">
+          <div>
+            <h2>Arbitrage Opportunities</h2>
+            <p>Best net-positive opportunity from buy exchange best ask against sell exchange best bid.</p>
+          </div>
+        </div>
+        <div id="opportunitiesWrap" class="tableWrap"></div>
+      </section>
+
+      <section id="depthSection" class="workspace" aria-label="Depth simulation">
+        <div class="tableHeader">
+          <div>
+            <h2>Depth Simulation</h2>
+            <p>Estimated route after walking order books within the capital and leverage cap.</p>
+          </div>
+        </div>
+        <div id="depthWrap" class="tableWrap"></div>
+      </section>
+
+      <section id="recordedSection" class="workspace" aria-label="Recorded arbitrage opportunities" hidden>
+        <div class="tableHeader">
+          <div>
+            <h2>Recorded Opportunities</h2>
+            <p>Net-positive detections recorded while this server is running.</p>
+          </div>
+        </div>
+        <div id="recordedWrap" class="tableWrap compactTableWrap"></div>
+      </section>
+
+      <section id="spreadLogSection" class="workspace" aria-label="Interesting opportunities">
+        <div class="tableHeader">
+          <div>
+            <h2>Interesting Opportunities</h2>
+            <p>Largest recorded spread and highest estimated net seen since this server started.</p>
+          </div>
+        </div>
+        <div id="spreadLogWrap" class="tableWrap"></div>
+      </section>
+
+      <section id="paperChecksSection" class="workspace" aria-label="Paper execution checks">
+        <div class="tableHeader">
+          <div>
+            <h2>Paper Execution Checks</h2>
+            <p>Delayed re-checks of detected routes after 250ms, 500ms, 1s, and 2s.</p>
+          </div>
+        </div>
+        <div id="paperChecksWrap" class="tableWrap compactTableWrap"></div>
+      </section>
+
+      <section id="fakeTradesSection" class="workspace" aria-label="Fake trades">
+        <div class="tableHeader">
+          <div>
+            <h2>Fake Trades</h2>
+            <p>Simulated paired executions using the same executable depth and margin settings.</p>
+          </div>
+        </div>
+        <div id="fakeTradesWrap" class="tableWrap compactTableWrap"></div>
+      </section>
+
+      <section id="openPositionsSection" class="workspace" aria-label="Open simulated positions">
+        <div class="tableHeader">
+          <div>
+            <h2>Open Positions</h2>
+            <p>Simulated long/short pairs marked to current depth. Unrealized net assumes closing right now (entry fees + exit fees + current exit spread).</p>
+          </div>
+        </div>
+        <div id="openPositionsWrap" class="tableWrap compactTableWrap"></div>
+      </section>
+
+      <section id="closedTradesSection" class="workspace" aria-label="Closed simulated trades">
+        <div class="tableHeader">
+          <div>
+            <h2>Closed Trades (realized)</h2>
+            <p>Positions closed when entry-direction spread crossed zero. Realized net = entry spread - exit spread - all fees. P/L vs estimated shows how much of the entry-time edge actually survived.</p>
+          </div>
+        </div>
+        <div id="closedTradesWrap" class="tableWrap compactTableWrap"></div>
+      </section>
+    </main>
+
+    <script src="/app.js?v=31" type="module"></script>
+  </body>
+</html>
