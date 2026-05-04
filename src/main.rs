@@ -687,6 +687,8 @@ async fn api_reset_realized_trades(State(state): State<AppState>) -> impl IntoRe
         runtime.realized_cumulative_net = 0.0;
         runtime.realized_trades_reset_at = reset_at.clone();
         runtime.open_decision_stats = OpenDecisionStats::default();
+        // Fresh experiment: drop per-route PnL memory so old closes do not gate new opens.
+        runtime.route_quality_stats.clear();
     }
     {
         let mut snapshot = state.snapshot.write().await;
@@ -696,7 +698,15 @@ async fn api_reset_realized_trades(State(state): State<AppState>) -> impl IntoRe
         snapshot.realized_trades_reset_at = reset_at.clone();
         snapshot.open_decision_stats = OpenDecisionStats::default();
     }
-    Json(serde_json::json!({ "ok": true, "realizedTradesResetAt": reset_at }))
+    if let Some(parent) = Path::new(CLOSED_TRADES_LOG_PATH).parent() {
+        let _ = fs::create_dir_all(parent).await;
+    }
+    let _ = fs::write(CLOSED_TRADES_LOG_PATH, b"").await;
+    Json(serde_json::json!({
+        "ok": true,
+        "realizedTradesResetAt": reset_at,
+        "closedTradesLogTruncated": CLOSED_TRADES_LOG_PATH,
+    }))
 }
 
 async fn api_settings(
