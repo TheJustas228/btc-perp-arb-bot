@@ -5,7 +5,10 @@ const state = {
   lastPayloadAt: 0,
   thresholdDraft: null,
   capitalDraft: null,
-  colorblindMode: localStorage.getItem("colorblindMode") === "1"
+  colorblindMode: localStorage.getItem("colorblindMode") === "1",
+  collapsedSections: new Set(
+    JSON.parse(localStorage.getItem("collapsedSections") || "[]")
+  )
 };
 
 function focusedInputId() {
@@ -67,6 +70,65 @@ function setConnection(status, text) {
 function applyColorMode() {
   document.body.classList.toggle("colorblindMode", state.colorblindMode);
   els.colorModeToggle.checked = state.colorblindMode;
+}
+
+function sectionKey(section, index) {
+  if (section.id) return section.id;
+  const title = section.querySelector("h2")?.textContent?.trim();
+  if (title) return title.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+  return `workspace-${index}`;
+}
+
+function persistCollapsedSections() {
+  localStorage.setItem(
+    "collapsedSections",
+    JSON.stringify([...state.collapsedSections])
+  );
+}
+
+function setSectionCollapsed(section, key, collapsed, button) {
+  section.classList.toggle("workspaceCollapsed", collapsed);
+  button.textContent = collapsed ? "▸" : "▾";
+  button.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  button.setAttribute(
+    "aria-label",
+    `${collapsed ? "Expand" : "Collapse"} ${section.querySelector("h2")?.textContent || "section"}`
+  );
+  if (collapsed) {
+    state.collapsedSections.add(key);
+  } else {
+    state.collapsedSections.delete(key);
+  }
+}
+
+function initSectionToggles() {
+  const sections = [...document.querySelectorAll(".workspace")];
+  sections.forEach((section, index) => {
+    const header = section.querySelector(".tableHeader");
+    const wrap = section.querySelector(".tableWrap");
+    if (!header || !wrap) return;
+
+    const key = sectionKey(section, index);
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "sectionToggle";
+    toggle.dataset.sectionKey = key;
+
+    setSectionCollapsed(
+      section,
+      key,
+      state.collapsedSections.has(key),
+      toggle
+    );
+
+    toggle.addEventListener("click", () => {
+      const next = !section.classList.contains("workspaceCollapsed");
+      setSectionCollapsed(section, key, next, toggle);
+      persistCollapsedSections();
+    });
+
+    header.append(toggle);
+  });
 }
 
 function formatAge(iso) {
@@ -715,9 +777,46 @@ function renderFakeTrades(payload) {
 
 function renderOpenPositions(payload) {
   const positions = payload.openPositions || [];
-
+  const stats = payload.openDecisionStats || {};
+  const attempted = Number(stats.attempted || 0);
+  const opened = Number(stats.opened || 0);
+  const rejected = Math.max(0, attempted - opened);
+  const topReasons = [
+    ["No depth", Number(stats.rejectNoDepth || 0)],
+    ["Basis not warm", Number(stats.rejectBasisNotWarm || 0)],
+    ["Below basis", Number(stats.rejectBasisThreshold || 0)],
+    ["Below shock", Number(stats.rejectShockThreshold || 0)],
+    ["Fee multiple", Number(stats.rejectFeeMultiple || 0)],
+    ["Haircut gate", Number(stats.rejectHaircut || 0)],
+    ["Route quality avg", Number(stats.rejectRouteQualityAvg || 0)],
+    ["Route quality ratio", Number(stats.rejectRouteQualityRealization || 0)],
+    ["Pair already open", Number(stats.rejectPairAlreadyOpen || 0)],
+    ["Max open", Number(stats.rejectMaxOpenPositions || 0)],
+    ["Below min entry net", Number(stats.rejectMinEntryEstimatedNet || 0)],
+    ["Not on route allowlist", Number(stats.rejectRouteAllowlist || 0)]
+  ]
+    .filter(([, count]) => count > 0)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5);
+  const reasonsText =
+    topReasons.length > 0
+      ? topReasons
+          .map(([label, count]) => `${label}: ${count}`)
+          .join(" | ")
+      : "No rejections yet";
+  const decisionSummary = `
+    <div class="netTotal paperSummary">
+      <div>
+        <span>Open decisions</span>
+        <strong>${attempted === 0 ? "--" : `${opened}/${attempted}`}</strong>
+        <span>${opened} opened, ${rejected} rejected</span>
+        <span>${reasonsText}</span>
+      </div>
+    </div>`;
+ 
   if (positions.length === 0) {
     els.openPositionsWrap.innerHTML = `
+      ${decisionSummary}
       <table class="opportunitiesTable">
         <thead>
           <tr>
@@ -781,6 +880,7 @@ function renderOpenPositions(payload) {
     .join("");
 
   els.openPositionsWrap.innerHTML = `
+    ${decisionSummary}
     <table class="opportunitiesTable">
       <thead>
         <tr>
@@ -977,4 +1077,5 @@ document.addEventListener("click", async (event) => {
 });
 
 applyColorMode();
+initSectionToggles();
 loadTickers();

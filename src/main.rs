@@ -435,6 +435,10 @@ struct RuntimeState {
     route_quality_stats: HashMap<String, RouteQualityStats>,
     /// Live counters of open-attempt decisions by gate/reason.
     open_decision_stats: OpenDecisionStats,
+    /// If set, only `buy_name->sell_name` routes in this set may open.
+    allowed_routes_only: Option<HashSet<String>>,
+    /// If set, `entry_estimated_net` must be >= this (USD) to open.
+    min_entry_estimated_net_floor: Option<f64>,
 }
 
 #[derive(Clone, Default)]
@@ -542,6 +546,10 @@ struct OpenDecisionStats {
     reject_route_quality_avg: u64,
     #[serde(rename = "rejectRouteQualityRealization")]
     reject_route_quality_realization: u64,
+    #[serde(rename = "rejectMinEntryEstimatedNet")]
+    reject_min_entry_estimated_net: u64,
+    #[serde(rename = "rejectRouteAllowlist")]
+    reject_route_allowlist: u64,
 }
 
 impl OpenDecisionStats {
@@ -569,6 +577,8 @@ async fn main() -> anyhow::Result<()> {
     let stored = load_stored_records().await.unwrap_or_default();
     let stored_account_capital_usd = stored_account_capital(&stored);
     let initial_threshold = initial_min_depth_net_threshold(&stored);
+    let allowed_routes_only = parse_allowed_routes_only();
+    let min_entry_estimated_net_floor = parse_min_entry_estimated_net_floor();
 
     let snapshot = Arc::new(RwLock::new(initial_snapshot(
         poll_ms,
@@ -597,6 +607,8 @@ async fn main() -> anyhow::Result<()> {
         pair_basis_stats: HashMap::new(),
         route_quality_stats: HashMap::new(),
         open_decision_stats: OpenDecisionStats::default(),
+        allowed_routes_only: allowed_routes_only.clone(),
+        min_entry_estimated_net_floor,
     }));
     let state = AppState {
         snapshot: snapshot.clone(),
@@ -628,6 +640,17 @@ async fn main() -> anyhow::Result<()> {
     println!(
         "Simulated closes append to {CLOSED_TRADES_LOG_PATH} (analyze with scripts/analyze_closed_trades.py)"
     );
+    match &min_entry_estimated_net_floor {
+        Some(f) => println!("Min modeled entry net: {f} USDT (MIN_ENTRY_ESTIMATED_NET=0 disables)"),
+        None => println!("Min modeled entry net: off"),
+    }
+    match &allowed_routes_only {
+        Some(s) if !s.is_empty() => println!(
+            "Route allowlist: {} route(s) (ALLOW_ROUTES_ONLY)",
+            s.len()
+        ),
+        _ => {}
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -1797,6 +1820,13 @@ fn maybe_open_position(
         OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_no_depth);
         return;
     };
+    let route_key = format!("{buy_name}->{sell_name}");
+    if let Some(allowed) = &runtime.allowed_routes_only {
+        if !allowed.contains(&route_key) {
+            OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_route_allowlist);
+            return;
+        }
+    }
     let key = pair_key(buy_name, sell_name);
     if runtime.open_position_keys.contains(&key) {
         OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_pair_already_open);
@@ -1828,6 +1858,13 @@ fn maybe_open_position(
         return;
     };
 
+    if let Some(floor) = runtime.min_entry_estimated_net_floor {
+        if entry_estimated_net < floor {
+            OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_min_entry_estimated_net);
+            return;
+        }
+    }
+
     // Basis filter: statistical significance vs typical **top-of-book** spread.
     //
     // `update_pair_basis_stats` records `sell_bid - buy_ask` from tickers.
@@ -1836,7 +1873,6 @@ fn maybe_open_position(
     // and biased toward marginal fills that then died in fees at timeout.
     // Depth economics stay enforced by `estimated_net_profit` + fee gates.
     let basis_key = format!("{buy_name}>{sell_name}");
-    let route_key = format!("{buy_name}->{sell_name}");
     let (Some(tob_buy_ask), Some(tob_sell_bid)) =
         (buy_book.asks.first(), sell_book.bids.first())
     else {
@@ -2384,6 +2420,42 @@ fn env_fee_rate(key: &str, default: f64) -> f64 {
         .and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v > 0.0 && *v <= 0.05)
         .unwrap_or(default)
+}
+
+/// Default minimum modeled entry net (USD) when `MIN_ENTRY_ESTIMATED_NET` is unset.
+/// Matches the weakest winner in early closed-trade logs; raise to be more selective.
+const DEFAULT_MIN_ENTRY_ESTIMATED_NET_USD: f64 = 2.20;
+
+fn parse_min_entry_estimated_net_floor() -> Option<f64> {
+    match std::env::var("MIN_ENTRY_ESTIMATED_NET") {
+        Ok(s) => {
+            let t = s.trim();
+            if t.is_empty() || t == "0" || t.eq_ignore_ascii_case("off") {
+                None
+            } else {
+                t.parse().ok().filter(|v: &f64| v.is_finite() && *v > 0.0)
+            }
+        }
+        Err(_) => Some(DEFAULT_MIN_ENTRY_ESTIMATED_NET_USD),
+    }
+}
+
+/// Comma-separated `Buy Venue->Sell Venue` strings; if non-empty, only those routes open.
+fn parse_allowed_routes_only() -> Option<HashSet<String>> {
+    let Ok(s) = std::env::var("ALLOW_ROUTES_ONLY") else {
+        return None;
+    };
+    let set: HashSet<String> = s
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+        .collect();
+    if set.is_empty() {
+        None
+    } else {
+        Some(set)
+    }
 }
 
 fn now() -> String {
