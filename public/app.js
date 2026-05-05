@@ -793,7 +793,8 @@ function renderOpenPositions(payload) {
     ["Pair already open", Number(stats.rejectPairAlreadyOpen || 0)],
     ["Max open", Number(stats.rejectMaxOpenPositions || 0)],
     ["Below min entry net", Number(stats.rejectMinEntryEstimatedNet || 0)],
-    ["Not on route allowlist", Number(stats.rejectRouteAllowlist || 0)]
+    ["Not on route allowlist", Number(stats.rejectRouteAllowlist || 0)],
+    ["Entry fees too high", Number(stats.rejectEntryFeesCap || 0)]
   ]
     .filter(([, count]) => count > 0)
     .sort((a, b) => b[1] - a[1])

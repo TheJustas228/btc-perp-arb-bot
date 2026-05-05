@@ -33,14 +33,14 @@ const MAX_CLOSED_TRADES: usize = 100;
 /// half the entry edge is realized).
 /// Slightly earlier banked profit so fee drag on slow mean-reversion
 /// does not dominate as often before timeout.
-const POSITION_TAKE_PROFIT_FRACTION: f64 = 0.42;
+const POSITION_TAKE_PROFIT_FRACTION: f64 = 0.35;
 /// Stop loss when unrealized net reaches this multiple of the entry-time
 /// estimated edge in the wrong direction (e.g. -1.0 means close once we
 /// have lost as much as the original projected gain).
-const POSITION_STOP_LOSS_FRACTION: f64 = -1.0;
+const POSITION_STOP_LOSS_FRACTION: f64 = -0.60;
 /// Hard time stop. Far shorter than the previous 600 ticks because basis
 /// trades that haven't moved in a couple of minutes statistically don't.
-const POSITION_TIMEOUT_TICKS: u32 = 90;
+const POSITION_TIMEOUT_TICKS: u32 = 60;
 /// EMA smoothing factor for the per-pair basis (TOB gross spread).
 /// 0.05 corresponds to ~20-poll half-life, ~30s at the default 1.5s poll.
 const BASIS_EMA_ALPHA: f64 = 0.05;
@@ -55,7 +55,7 @@ const BASIS_K_SIGMA: f64 = 1.2;
 const SHOCK_BASIS_K_SIGMA: f64 = 1.35;
 /// Require entry estimated net to be at least this multiple of expected
 /// round-trip fees. Prevents entering tiny edges where fee drag dominates.
-const MIN_NET_TO_FEE_MULTIPLIER: f64 = 1.35;
+const MIN_NET_TO_FEE_MULTIPLIER: f64 = 2.20;
 /// Conservative haircut from estimated entry net to expected realized net.
 /// Derived from observed realized-vs-estimated slippage in this strategy.
 const EXPECTED_REALIZED_HAIRCUT: f64 = 0.50;
@@ -439,6 +439,8 @@ struct RuntimeState {
     allowed_routes_only: Option<HashSet<String>>,
     /// If set, `entry_estimated_net` must be >= this (USD) to open.
     min_entry_estimated_net_floor: Option<f64>,
+    /// If set, reject entries whose one-side modeled fees exceed this USD cap.
+    max_entry_fees_usd: Option<f64>,
 }
 
 #[derive(Clone, Default)]
@@ -550,6 +552,8 @@ struct OpenDecisionStats {
     reject_min_entry_estimated_net: u64,
     #[serde(rename = "rejectRouteAllowlist")]
     reject_route_allowlist: u64,
+    #[serde(rename = "rejectEntryFeesCap")]
+    reject_entry_fees_cap: u64,
 }
 
 impl OpenDecisionStats {
@@ -579,6 +583,7 @@ async fn main() -> anyhow::Result<()> {
     let initial_threshold = initial_min_depth_net_threshold(&stored);
     let allowed_routes_only = parse_allowed_routes_only();
     let min_entry_estimated_net_floor = parse_min_entry_estimated_net_floor();
+    let max_entry_fees_usd = parse_max_entry_fees_usd();
 
     let snapshot = Arc::new(RwLock::new(initial_snapshot(
         poll_ms,
@@ -609,6 +614,7 @@ async fn main() -> anyhow::Result<()> {
         open_decision_stats: OpenDecisionStats::default(),
         allowed_routes_only: allowed_routes_only.clone(),
         min_entry_estimated_net_floor,
+        max_entry_fees_usd,
     }));
     let state = AppState {
         snapshot: snapshot.clone(),
@@ -643,6 +649,10 @@ async fn main() -> anyhow::Result<()> {
     match &min_entry_estimated_net_floor {
         Some(f) => println!("Min modeled entry net: {f} USDT (MIN_ENTRY_ESTIMATED_NET=0 disables)"),
         None => println!("Min modeled entry net: off"),
+    }
+    match &max_entry_fees_usd {
+        Some(v) => println!("Max modeled one-side entry fees: {v} USDT (MAX_ENTRY_FEES_USD=0 disables)"),
+        None => println!("Max modeled one-side entry fees: off"),
     }
     match &allowed_routes_only {
         Some(s) if !s.is_empty() => println!(
@@ -1864,6 +1874,12 @@ fn maybe_open_position(
             return;
         }
     }
+    if let Some(fee_cap) = runtime.max_entry_fees_usd {
+        if entry_fees > fee_cap {
+            OpenDecisionStats::bump(&mut runtime.open_decision_stats.reject_entry_fees_cap);
+            return;
+        }
+    }
 
     // Basis filter: statistical significance vs typical **top-of-book** spread.
     //
@@ -2424,7 +2440,7 @@ fn env_fee_rate(key: &str, default: f64) -> f64 {
 
 /// Default minimum modeled entry net (USD) when `MIN_ENTRY_ESTIMATED_NET` is unset.
 /// Matches the weakest winner in early closed-trade logs; raise to be more selective.
-const DEFAULT_MIN_ENTRY_ESTIMATED_NET_USD: f64 = 2.20;
+const DEFAULT_MIN_ENTRY_ESTIMATED_NET_USD: f64 = 2.55;
 
 fn parse_min_entry_estimated_net_floor() -> Option<f64> {
     match std::env::var("MIN_ENTRY_ESTIMATED_NET") {
@@ -2455,6 +2471,24 @@ fn parse_allowed_routes_only() -> Option<HashSet<String>> {
         None
     } else {
         Some(set)
+    }
+}
+
+/// Default maximum one-side modeled fees at entry (USD). High-fee trades in logs
+/// (entry+exit ~2.5 USDT) were consistently unprofitable.
+const DEFAULT_MAX_ENTRY_FEES_USD: f64 = 0.35;
+
+fn parse_max_entry_fees_usd() -> Option<f64> {
+    match std::env::var("MAX_ENTRY_FEES_USD") {
+        Ok(s) => {
+            let t = s.trim();
+            if t.is_empty() || t == "0" || t.eq_ignore_ascii_case("off") {
+                None
+            } else {
+                t.parse().ok().filter(|v: &f64| v.is_finite() && *v > 0.0)
+            }
+        }
+        Err(_) => Some(DEFAULT_MAX_ENTRY_FEES_USD),
     }
 }
 
