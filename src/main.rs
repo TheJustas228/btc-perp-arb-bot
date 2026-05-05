@@ -33,14 +33,14 @@ const MAX_CLOSED_TRADES: usize = 100;
 /// half the entry edge is realized).
 /// Slightly earlier banked profit so fee drag on slow mean-reversion
 /// does not dominate as often before timeout.
-const POSITION_TAKE_PROFIT_FRACTION: f64 = 0.35;
+const POSITION_TAKE_PROFIT_FRACTION: f64 = 0.12;
 /// Stop loss when unrealized net reaches this multiple of the entry-time
 /// estimated edge in the wrong direction (e.g. -1.0 means close once we
 /// have lost as much as the original projected gain).
-const POSITION_STOP_LOSS_FRACTION: f64 = -0.60;
+const POSITION_STOP_LOSS_FRACTION: f64 = -0.30;
 /// Hard time stop. Far shorter than the previous 600 ticks because basis
 /// trades that haven't moved in a couple of minutes statistically don't.
-const POSITION_TIMEOUT_TICKS: u32 = 60;
+const POSITION_TIMEOUT_TICKS: u32 = 45;
 /// EMA smoothing factor for the per-pair basis (TOB gross spread).
 /// 0.05 corresponds to ~20-poll half-life, ~30s at the default 1.5s poll.
 const BASIS_EMA_ALPHA: f64 = 0.05;
@@ -55,7 +55,7 @@ const BASIS_K_SIGMA: f64 = 1.2;
 const SHOCK_BASIS_K_SIGMA: f64 = 1.35;
 /// Require entry estimated net to be at least this multiple of expected
 /// round-trip fees. Prevents entering tiny edges where fee drag dominates.
-const MIN_NET_TO_FEE_MULTIPLIER: f64 = 2.20;
+const MIN_NET_TO_FEE_MULTIPLIER: f64 = 6.00;
 /// Conservative haircut from estimated entry net to expected realized net.
 /// Derived from observed realized-vs-estimated slippage in this strategy.
 const EXPECTED_REALIZED_HAIRCUT: f64 = 0.50;
@@ -2440,7 +2440,7 @@ fn env_fee_rate(key: &str, default: f64) -> f64 {
 
 /// Default minimum modeled entry net (USD) when `MIN_ENTRY_ESTIMATED_NET` is unset.
 /// Matches the weakest winner in early closed-trade logs; raise to be more selective.
-const DEFAULT_MIN_ENTRY_ESTIMATED_NET_USD: f64 = 2.55;
+const DEFAULT_MIN_ENTRY_ESTIMATED_NET_USD: f64 = 2.78;
 
 fn parse_min_entry_estimated_net_floor() -> Option<f64> {
     match std::env::var("MIN_ENTRY_ESTIMATED_NET") {
